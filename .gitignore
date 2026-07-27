@@ -1,0 +1,27 @@
+# Secrets — NEVER commit these
+.env
+*.env
+token.json
+credentials.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# AWS SAM
+.aws-sam/
+packaged.yaml
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Pytest
+.pytest_cache/

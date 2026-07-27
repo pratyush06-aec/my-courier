@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  AWS Builder Mail Watcher Agent — An event-driven email monitoring agent
+  that uses Gmail Push Notifications, Amazon Bedrock, and multi-channel
+  notifications (Slack + WhatsApp).
+
+# ---------------------------------------------------------------------------
+# Global configuration applied to all Lambda functions in this template.
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Timeout: 60
+    MemorySize: 256
+    Runtime: python3.13
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        AWS_REGION_NAME: !Ref AWS::Region
+        DYNAMODB_TABLE_NAME: !Ref EmailProcessedTable
+        ALLOWED_SENDERS: !Ref AllowedSenders
+        BEDROCK_REGION: !Ref BedrockRegion
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+
+# ---------------------------------------------------------------------------
+# Parameters — configurable at deploy time via `sam deploy --parameter-overrides`
+# ---------------------------------------------------------------------------
+Parameters:
+  AllowedSenders:
+    Type: String
+    Default: "StudentBuilders@amazon.com,judkatha@amazon.com"
+    Description: Comma-separated list of allowed sender email addresses.
+
+  BedrockRegion:
+    Type: String
+    Default: "us-east-1"
+    Description: >
+      AWS region where Bedrock is available. eu-north-1 may not support
+      all models, so we default to us-east-1 for Bedrock calls.
+
+  BedrockModelId:
+    Type: String
+    Default: "anthropic.claude-3-haiku-20240307-v1:0"
+    Description: Bedrock model ID for email summarisation.
+
+  GmailSecretName:
+    Type: String
+    Default: "email-agent/gmail-credentials"
+    Description: Secrets Manager secret name for Gmail OAuth credentials.
+
+  SlackSecretName:
+    Type: String
+    Default: "email-agent/slack"
+    Description: Secrets Manager secret name for the Slack webhook URL.
+
+  TwilioSecretName:
+    Type: String
+    Default: "email-agent/twilio"
+    Description: Secrets Manager secret name for Twilio credentials.
+
+  PubSubTopicName:
+    Type: String
+    Default: ""
+    Description: >
+      Google Cloud Pub/Sub topic name for Gmail watch
+      (e.g. projects/my-project/topics/gmail-push).
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ── DynamoDB Table ────────────────────────────────────────────────────
+  EmailProcessedTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: EmailAgentProcessedMessages
+      BillingMode: PAY_PER_REQUEST          # Free-tier friendly; no capacity planning
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: EmailAgent
+
+  # ── Main Lambda Function ─────────────────────────────────────────────
+  EmailAgentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: email-agent-handler
+      CodeUri: ../lambda/
+      Handler: handler.lambda_handler
+      Description: >
+        Processes Gmail push notifications, summarises emails with Bedrock,
+        stores metadata in DynamoDB, and sends Slack/WhatsApp notifications.
+      Policies:
+        # DynamoDB read/write
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EmailProcessedTable
+        # Secrets Manager read
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:email-agent/*"
+        # Bedrock invoke (may be cross-region)
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource: "*"
+        # CloudWatch Logs (auto-created by SAM, but explicit for clarity)
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: "arn:aws:logs:*:*:*"
+      Events:
+        PubSubWebhook:
+          Type: Api
+          Properties:
+            Path: /webhook/gmail
+            Method: POST
+            RestApiId: !Ref EmailAgentApi
+
+  # ── API Gateway ──────────────────────────────────────────────────────
+  EmailAgentApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: email-agent-api
+      StageName: prod
+      Description: API Gateway for receiving Gmail Pub/Sub push notifications.
+
+  # ── Watch Renewal Lambda (EventBridge scheduled) ─────────────────────
+  # Gmail watches expire after 7 days.  This function renews the watch.
+  WatchRenewalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: email-agent-watch-renewal
+      CodeUri: ../lambda/
+      Handler: handler.renew_watch_handler
+      Description: Renews the Gmail push notification watch every 6 days.
+      Timeout: 30
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:email-agent/*"
+      Environment:
+        Variables:
+          PUBSUB_TOPIC_NAME: !Ref PubSubTopicName
+      Events:
+        ScheduledRenewal:
+          Type: Schedule
+          Properties:
+            Schedule: rate(6 days)
+            Description: Renews Gmail watch every 6 days (expires after 7).
+            Enabled: true
+
+# ---------------------------------------------------------------------------
+# Outputs — useful values after deployment
+# ---------------------------------------------------------------------------
+Outputs:
+  WebhookUrl:
+    Description: >
+      The URL to configure as the Google Cloud Pub/Sub push endpoint.
+    Value: !Sub "https://${EmailAgentApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhook/gmail"
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table.
+    Value: !Ref EmailProcessedTable
+
+  LambdaFunctionArn:
+    Description: ARN of the main Lambda function.
+    Value: !GetAtt EmailAgentFunction.Arn
